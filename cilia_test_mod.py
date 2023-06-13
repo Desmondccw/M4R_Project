@@ -70,7 +70,7 @@ class Cilium:
         #Coordinates is in zeta, r, phi
         self.coor= coordinates
         
-        #Constants should be r0, l_ambda, eta
+        #Constants should be r0, l_ambda, zeta
         self.constants= constants
         
         self.height= h
@@ -147,9 +147,7 @@ class Cilia_System:
         pos_list= [cil.pos for cil in self.list]
         
         n= self.len
-        
-        vel_vec=[]
-        
+                
         def d_coor_cil(index):
             
             pos_i= pos_list[index]
@@ -172,8 +170,30 @@ class Cilia_System:
     
         #return Parallel( n_jobs = 4)(delayed(d_coor_cil)(i) for i in range(len(self.list)))
         '''^Parallel implementation'''
+
+    def d_self(self):
+        '''velocity self-induced contribution (last minute addition for hacky pd calculations)'''
         
-    
+        force_vectors= [cil.f_vector for cil in self.list]
+        basis_changes= [cil.basis_change for cil in self.list]
+        pos_list= [cil.pos for cil in self.list]
+        
+        n= self.len
+                
+        def d_self_cil(index):
+            
+            pos_i= pos_list[index]
+            cil_i= self.list[index]
+            zeta, r , phi= cil_i.coor
+            
+            v_cil=  np.linalg.inv(friction(pos_i)) @ basis_changes[index] @ force_vectors[index]
+            
+            dr_phi, dr, dz= cil_i.basis_change.T @ v_cil
+            d_coor= np.array([dz, dr , dr_phi /r])
+            
+            return d_coor
+        
+        return [d_self_cil(i) for i in range(len(self.list))]  
 
     def update(self, stepsize=0.01):
         
@@ -328,7 +348,7 @@ def gen_system(X, lattice, forcings, const= [0.5, 0.1 ,10] ):
         
     return Cilia_System_1
 
-def d_core(t,X, lattice, forcings, const= [0.5, 0.1 ,10] ):
+def d_core(t, X, lattice, forcings, const= [0.5, 0.1 ,10] ):
 
     #Generates velocities given a state (X) in an array form.
     #t is a dummy variable added to work nicely with the scipy's solve_ivp function.
@@ -339,6 +359,20 @@ def d_core(t,X, lattice, forcings, const= [0.5, 0.1 ,10] ):
     c_sys= gen_system(X, lattice, forcings, const )
     
     return np.array(c_sys.d_coor()).flatten()
+
+def dself(t, X, lattice, forcings, const= [0.5, 0.1 ,10] ):
+
+    #Generates self-induced velocities given a state (X) in an array form.
+    #t is a dummy variable added to work nicely with the scipy's solve_ivp function.
+
+    n=len(lattice)
+    
+    X=np.array(X).reshape((n,3))
+    c_sys= gen_system(X, lattice, forcings, const )
+    
+    return np.array(c_sys.d_self()).flatten()
+
+''''JFNK code'''
 
 def flow_map(tf, X0, lattice, forcings, cons= [0.5, 0.1 ,10], maxstep=0.1):
 
@@ -375,3 +409,178 @@ def aug_residual(X_aug, lattice, forcings, cons= [0.5, 0.1 ,10], max_step=0.1):
         res[3*i+3]= min(np.abs(res[3*i+3] % (2*np.pi)), np.abs(2*np.pi - res[3*i+3] % (2*np.pi)))   
         
     return res
+
+''''Poincare Map'''
+
+def insert_zeta(X):
+    '''Input: state w/o zeta component'''
+    '''Output: state w/ zeta as 0'''
+    n= len(np.array(X).flatten())
+    
+    X=np.array(X).reshape((n//2,2))
+    X = np.insert(X, 0, 0., axis=1)
+    
+    return X.flatten()
+
+def extract_zeta(X):
+    
+    n= len(np.array(X).flatten())
+    
+    X= np.array(X).reshape((n//3,3))
+    X= np.delete(X, (0), axis=1)
+
+    return X.flatten() 
+
+def mod_flow(t, X, lattice, forcings, cons= [0.5, 0.1 ,10], max_step=0.1):
+    
+    '''Input: time, state without zeta component'''
+    '''Return: flow state without zeta comp'''
+    
+    new_X = insert_zeta(X)
+    solve= flow_map(t, new_X, lattice, forcings, cons, max_step)
+        
+    return extract_zeta(solve)
+
+def poincare_map(state, lattice, forcings):
+    '''Poincare map takes in a state and gives an iteration on the poincare map'''
+    eps= 0.2
+
+    time= state[0] - eps
+    X_state= state[1:]
+
+    '''Phi of first cilium is used to define Poincare cut'''
+
+    phi= X_state[1] % (2*np.pi)
+
+    '''Use flow map to iterate on most of the loop'''
+    
+    new_state= flow_map(time, X_state, lattice, forcings, cons= [0.5, 0.1 ,10], maxstep=0.1)
+
+    '''Use d_core to march towards te poincare cure'''
+
+    while new_state[2]< phi:
+        update_size= 0.0002
+        new_state+= d_core(0,new_state, lattice, forcings)* update_size
+
+    return new_state
+
+'''Power Dissipation '''
+
+def power_diss(X, lattice, forcings, const= [0.5, 0.1 ,10] ):
+
+    '''Calculate power dissapation'''
+
+    dcore= d_core(0, X, lattice, forcings, const= [0.5, 0.1 ,10])
+
+    n= len(np.array(X).flatten())//3
+
+    rs_dcore= dcore.reshape((n,3))
+    new_X= np.array(X).reshape((n,3))
+
+    power_diss= []
+
+    for count, dc  in enumerate(rs_dcore) :
+
+        dz , dr , dphi = dc
+        '''Want to convert to x, y ,z coor '''
+
+        coor= new_X[count]
+
+        r= coor[1]
+        phi= coor[2]
+
+        basis_change= change_basis(phi)
+
+        dxyz= basis_change @ np.array([r*dphi, dr ,dz])
+
+        '''Want to find corresponding friction tensor (only z is needed) '''
+
+        h=1
+        z= h+ r * np.cos(phi)
+
+        fric= friction([0,0,z])
+
+        pd= dxyz @ fric @ dxyz.T
+
+        power_diss.append(pd)
+
+    return  np.array(power_diss)
+
+def mod_power_diss(X, lattice, forcings, const= [0.5, 0.1 ,10]):
+
+    dcore= dself(0, X, lattice, forcings, const= [0.5, 0.1 ,10])
+
+    n= len(np.array(X).flatten())//3
+
+    rs_dcore= dcore.reshape((n,3))
+    new_X= np.array(X).reshape((n,3))
+
+    power_diss= []
+
+    for count, dc  in enumerate(rs_dcore) :
+
+        dz , dr , dphi = dc
+        '''Want to convert to x, y ,z coor '''
+
+        coor= new_X[count]
+
+        r= coor[1]
+        phi= coor[2]
+
+        basis_change= change_basis(phi)
+
+        dxyz= basis_change @ np.array([r*dphi, dr ,dz])
+
+        '''Want to find corresponding friction tensor (only z is needed) '''
+
+        h=1
+        z= h+ r * np.cos(phi)
+
+        fric= friction([0,0,z])
+
+        pd= dxyz @ fric @ dxyz.T
+
+        power_diss.append(pd)
+
+    return  np.array(power_diss)
+
+def int_mod_power_diss(tf, X0, lattice, forcings, cons= [0.5, 0.1 ,10], maxstep=0.1):
+
+    sol= solve_ivp(lambda t, y: d_core(t, y, lattice, forcings, cons), t_span=(0, tf), y0= np.array(X0).flatten(), max_step= maxstep)
+
+    states, times = sol.y.T , sol.t
+
+    pd_arr= np.array([mod_power_diss(state, lattice, forcings, const= [0.5, 0.1 ,10] ) for state in states])
+
+    #pds= [(pd1 + pd2) / 2 for pd1, pd2 in zip(pd_arr[::2], pd_arr[1::2])]
+    time_diff= np.diff(times)
+
+    n= len(pd_arr)-1
+
+    pd_avg= [(pd_arr[i] + pd_arr[i+1])/2 for i in range(n)]
+
+    intpower_diss= np.sum( np.array([pd_avg[i]* time_diff[i] for i in range(n)]), axis=0)
+
+    return intpower_diss
+
+
+
+def int_power_diss(tf, X0, lattice, forcings, cons= [0.5, 0.1 ,10], maxstep=0.1):
+
+    sol= solve_ivp(lambda t, y: d_core(t, y, lattice, forcings, cons), t_span=(0, tf), y0= np.array(X0).flatten(), max_step= maxstep)
+
+    states, times = sol.y.T , sol.t
+
+    pd_arr= np.array([power_diss(state, lattice, forcings, const= [0.5, 0.1 ,10] ) for state in states])
+
+    #pds= [(pd1 + pd2) / 2 for pd1, pd2 in zip(pd_arr[::2], pd_arr[1::2])]
+    time_diff= np.diff(times)
+
+    n= len(pd_arr)-1
+
+    pd_avg= [(pd_arr[i] + pd_arr[i+1])/2 for i in range(n)]
+
+    intpower_diss= np.sum( np.array([pd_avg[i]* time_diff[i] for i in range(n)]), axis=0)
+
+    return intpower_diss
+
